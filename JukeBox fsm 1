@@ -1,0 +1,334 @@
+#include <SPI.h>
+#include <MFRC522.h>
+#include <LiquidCrystal.h>
+#include <SoftwareSerial.h>
+#include <DFRobotDFPlayerMini.h>
+
+#define RST_PIN     9
+#define SS_PIN      10
+#define DFPLAYER_RX 14
+#define DFPLAYER_TX 15
+
+MFRC522 mfrc522(SS_PIN, RST_PIN);
+LiquidCrystal lcd(7, 6, 5, 4, 3, 2);
+SoftwareSerial dfSerial(DFPLAYER_TX, DFPLAYER_RX);
+DFRobotDFPlayerMini dfPlayer;
+
+byte tag1UID[]   = {0xA5, 0x23, 0xF3, 0x06};
+byte tag2UID[]   = {0xB3, 0xEA, 0x66, 0x06};
+byte tag3UID[]   = {0xC2, 0xF2, 0xEF, 0x06}; // safety message
+byte tag4UID[]   = {0x4D, 0x8B, 0x63, 0x06}; // flash W
+byte uidLength   = 4;
+
+enum State {
+  IDLE,
+  INTRO,
+  WINDING,
+  AMBIENT_1,
+  AMBIENT_2,
+  PLAYABLE_1,
+  SAFETY
+};
+
+State currentState   = IDLE;
+State returnState    = AMBIENT_1;
+State preSafetyState = AMBIENT_1;
+
+bool gameStarted     = false;
+
+// --- W flash ---
+bool flashingW            = false;
+unsigned long flashStartTime  = 0;
+unsigned long flashLastToggle = 0;
+const unsigned long W_FLASH_DURATION = 3000;
+const unsigned long W_FLASH_INTERVAL = 300;
+bool wVisible             = false;
+
+const int TRACK_INTRO     = 1;
+const int TRACK_AMBIENT_1 = 2;
+const int TRACK_AMBIENT_2 = 3;
+const int TRACK_PLAYABLE  = 4;
+const int TRACK_SAFETY    = 5;
+const int TRACK_WINDUP    = 6;
+
+unsigned long lastScanTime  = 0;
+unsigned long lastRFIDCheck = 0;
+const unsigned long RESET_INTERVAL = 10000;
+const unsigned long SCAN_COOLDOWN  = 1500;
+const unsigned long RFID_POLL      = 100;
+
+// --- Helpers ---
+
+void setLCDTop(const char* line) {
+  lcd.setCursor(0, 0);
+  lcd.print("                ");
+  lcd.setCursor(0, 0);
+  lcd.print(line);
+}
+
+void setLCDBottom(const char* line) {
+  lcd.setCursor(0, 1);
+  lcd.print("                ");
+  lcd.setCursor(0, 1);
+  lcd.print(line);
+}
+
+void restoreLCD() {
+  // restores both rows to match current state
+  switch (currentState) {
+    case IDLE:
+      setLCDTop("     Jukebox   ");
+      setLCDBottom("      Idle      ");
+      break;
+    case INTRO:
+      setLCDTop("  Now Playing   ");
+      setLCDBottom(" Introduction   ");
+      break;
+    case WINDING:
+      setLCDTop("  Now Playing   ");
+      setLCDBottom("                ");
+      break;
+    case AMBIENT_1:
+    case AMBIENT_2:
+      setLCDTop("  Now Playing   ");
+      setLCDBottom(" Ambient Track  ");
+      break;
+    case PLAYABLE_1:
+      setLCDTop("  Now Playing   ");
+      setLCDBottom("    Song One    ");
+      break;
+    case SAFETY:
+      setLCDTop("  Now Playing   ");
+      setLCDBottom(" Safety Message ");
+      break;
+  }
+}
+
+bool isFinished() {
+  return dfPlayer.available() && dfPlayer.readType() == DFPlayerPlayFinished;
+}
+
+bool uidMatch(byte *scanned, byte *stored) {
+  for (byte i = 0; i < uidLength; i++) {
+    if (scanned[i] != stored[i]) return false;
+  }
+  return true;
+}
+
+// --- W flash handler ---
+
+void handleWFlash() {
+  if (!flashingW) return;
+
+  unsigned long now = millis();
+
+  if (now - flashStartTime >= W_FLASH_DURATION) {
+    // flash ended — restore screen
+    flashingW = false;
+    wVisible  = false;
+    restoreLCD();
+    return;
+  }
+
+  if (now - flashLastToggle >= W_FLASH_INTERVAL) {
+    flashLastToggle = now;
+    wVisible = !wVisible;
+    lcd.clear();
+    if (wVisible) {
+      lcd.setCursor(7, 0); // center of top row (col 7 of 16)
+      lcd.print("W");
+    }
+    // when not visible, screen stays blank during flash
+  }
+}
+
+// --- Wind up then transition ---
+
+void enterWindup(State target) {
+  currentState = WINDING;
+  returnState  = target;
+  dfPlayer.play(TRACK_WINDUP);
+  setLCDTop("  Now Playing   ");
+  setLCDBottom("                ");
+  Serial.println("STATE: WINDING -> " + String(target));
+}
+
+// --- State entry functions ---
+
+void enterIdle() {
+  currentState = IDLE;
+  gameStarted  = false;
+  dfPlayer.stop();
+  setLCDTop("    Jukebox   ");
+  setLCDBottom("      Idle      ");
+  Serial.println("STATE: IDLE");
+}
+
+void enterIntro() {
+  currentState = INTRO;
+  dfPlayer.play(TRACK_INTRO);
+  setLCDTop("  Now Playing   ");
+  setLCDBottom(" Introduction   ");
+  Serial.println("STATE: INTRO");
+}
+
+void enterAmbient1() {
+  currentState = AMBIENT_1;
+  dfPlayer.play(TRACK_AMBIENT_1);
+  setLCDTop("  Now Playing   ");
+  setLCDBottom(" Ambient Track  ");
+  Serial.println("STATE: AMBIENT_1");
+}
+
+void enterAmbient2() {
+  currentState = AMBIENT_2;
+  dfPlayer.play(TRACK_AMBIENT_2);
+  setLCDTop("  Now Playing   ");
+  setLCDBottom(" Ambient Track  ");
+  Serial.println("STATE: AMBIENT_2");
+}
+
+void enterPlayable1() {
+  currentState = PLAYABLE_1;
+  dfPlayer.play(TRACK_PLAYABLE);
+  setLCDTop("  Now Playing   ");
+  setLCDBottom("    Song One    ");
+  Serial.println("STATE: PLAYABLE_1");
+}
+
+void enterSafety() {
+  currentState = SAFETY;
+  dfPlayer.play(TRACK_SAFETY);
+  setLCDTop("  Now Playing   ");
+  setLCDBottom(" Safety Message ");
+  Serial.println("STATE: SAFETY");
+}
+
+// --- State handlers ---
+
+void handleIdle(bool tag1, bool tag2, bool tag3, bool tag4) {
+  if (tag1) enterIntro();
+}
+
+void handleIntro(bool tag1, bool tag2, bool tag3, bool tag4) {
+  if (tag1) { enterIdle(); return; }
+  if (isFinished()) {
+    gameStarted = true;
+    enterWindup(AMBIENT_1);
+  }
+}
+
+void handleWinding(bool tag1, bool tag2, bool tag3, bool tag4) {
+  if (tag1) { enterIdle(); return; }
+  if (isFinished()) {
+    switch (returnState) {
+      case AMBIENT_1:  enterAmbient1(); break;
+      case AMBIENT_2:  enterAmbient2(); break;
+      case PLAYABLE_1: enterPlayable1(); break;
+      case SAFETY:     enterSafety(); break;
+      default:         enterAmbient1(); break;
+    }
+  }
+}
+
+void handleAmbient1(bool tag1, bool tag2, bool tag3, bool tag4) {
+  if (tag1) { enterIdle(); return; }
+  if (tag2) { enterWindup(PLAYABLE_1); return; }
+  if (tag3 && gameStarted) { preSafetyState = AMBIENT_1; enterWindup(SAFETY); return; }
+  if (isFinished()) enterWindup(AMBIENT_2);
+}
+
+void handleAmbient2(bool tag1, bool tag2, bool tag3, bool tag4) {
+  if (tag1) { enterIdle(); return; }
+  if (tag2) { enterWindup(PLAYABLE_1); return; }
+  if (tag3 && gameStarted) { preSafetyState = AMBIENT_2; enterWindup(SAFETY); return; }
+  if (isFinished()) enterWindup(AMBIENT_1);
+}
+
+void handlePlayable1(bool tag1, bool tag2, bool tag3, bool tag4) {
+  if (tag1) { enterIdle(); return; }
+  if (tag2) { enterWindup(AMBIENT_1); return; }
+  if (tag3 && gameStarted) { preSafetyState = PLAYABLE_1; enterWindup(SAFETY); return; }
+  if (isFinished()) enterWindup(AMBIENT_1);
+}
+
+void handleSafety(bool tag1, bool tag2, bool tag3, bool tag4) {
+  if (tag1) { enterIdle(); return; }
+  if (tag3) {
+    switch (preSafetyState) {
+      case AMBIENT_1:  enterWindup(AMBIENT_1);  break;
+      case AMBIENT_2:  enterWindup(AMBIENT_2);  break;
+      case PLAYABLE_1: enterWindup(PLAYABLE_1); break;
+      default:         enterWindup(AMBIENT_1);  break;
+    }
+    return;
+  }
+  if (isFinished()) enterWindup(AMBIENT_1);
+}
+
+// --- Setup ---
+
+void setup() {
+  Serial.begin(9600);
+  dfSerial.begin(9600);
+  SPI.begin();
+  mfrc522.PCD_Init();
+  lcd.begin(16, 2);
+
+  if (!dfPlayer.begin(dfSerial)) {
+    setLCDTop("  DFPlayer Err  ");
+    setLCDBottom(" Check SD Card  ");
+    Serial.println("DFPlayer failed");
+    while (true);
+  }
+
+  dfPlayer.volume(25);
+  enterIdle();
+  lastScanTime = millis();
+}
+
+// --- Loop ---
+
+void loop() {
+  unsigned long now = millis();
+
+  if (now - lastScanTime > RESET_INTERVAL) {
+    mfrc522.PCD_Init();
+    lastScanTime = now;
+  }
+
+  handleWFlash();
+
+  bool tag1 = false, tag2 = false, tag3 = false, tag4 = false;
+
+  if (now - lastRFIDCheck >= RFID_POLL && now - lastScanTime >= SCAN_COOLDOWN) {
+    lastRFIDCheck = now;
+    if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
+      lastScanTime = now;
+      if      (uidMatch(mfrc522.uid.uidByte, tag1UID)) tag1 = true;
+      else if (uidMatch(mfrc522.uid.uidByte, tag2UID)) tag2 = true;
+      else if (uidMatch(mfrc522.uid.uidByte, tag3UID)) tag3 = true;
+      else if (uidMatch(mfrc522.uid.uidByte, tag4UID)) tag4 = true;
+      mfrc522.PICC_HaltA();
+      mfrc522.PCD_StopCrypto1();
+
+      if (tag4) {
+        flashingW       = true;
+        flashStartTime  = millis();
+        flashLastToggle = millis() - W_FLASH_INTERVAL; // trigger immediately
+        wVisible        = false;
+        tag4            = false;
+      }
+    }
+  }
+
+  switch (currentState) {
+    case IDLE:       handleIdle(tag1, tag2, tag3, tag4);       break;
+    case INTRO:      handleIntro(tag1, tag2, tag3, tag4);      break;
+    case WINDING:    handleWinding(tag1, tag2, tag3, tag4);    break;
+    case AMBIENT_1:  handleAmbient1(tag1, tag2, tag3, tag4);   break;
+    case AMBIENT_2:  handleAmbient2(tag1, tag2, tag3, tag4);   break;
+    case PLAYABLE_1: handlePlayable1(tag1, tag2, tag3, tag4);  break;
+    case SAFETY:     handleSafety(tag1, tag2, tag3, tag4);     break;
+  }
+}
